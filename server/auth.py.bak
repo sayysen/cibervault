@@ -1,0 +1,54 @@
+"""Agent token authentication - simple HMAC-signed tokens."""
+
+import os
+import time
+import hmac
+import hashlib
+import base64
+import json
+from fastapi import HTTPException
+
+
+def _secret() -> bytes:
+    """Always read secret fresh from environment."""
+    s = os.getenv("AGENT_SECRET", "")
+    if not s:
+        # Try loading from server.env directly
+        try:
+            with open("/opt/cibervault/server.env") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("AGENT_SECRET="):
+                        s = line.split("=", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+    if not s:
+        s = "cibervault-default-secret-change-me"
+    return s.encode()
+
+
+def create_token(agent_id: str) -> str:
+    payload = json.dumps({"agent_id": agent_id, "iat": int(time.time())})
+    data    = base64.urlsafe_b64encode(payload.encode()).decode()
+    sig     = hmac.new(_secret(), data.encode(), hashlib.sha256).hexdigest()
+    return f"{data}.{sig}"
+
+
+def verify_token(authorization: str) -> str:
+    """Verify Bearer token, return agent_id."""
+    try:
+        parts = authorization.split(" ", 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            raise ValueError("Not a Bearer token")
+        token = parts[1].strip()
+        data, sig = token.rsplit(".", 1)
+        expected  = hmac.new(_secret(), data.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise ValueError("Bad signature")
+        payload = json.loads(base64.urlsafe_b64decode(data + "==").decode())
+        return payload["agent_id"]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")

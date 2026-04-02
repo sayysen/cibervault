@@ -1,0 +1,2240 @@
+"""
+Cibervault EDR — Alert Ingestion Server
+Receives telemetry from agents, stores events, streams to dashboard via WebSocket.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional
+
+import aiosqlite
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Header, Request
+
+# Load server.env into environment on startup
+def _load_env():
+    env_path = "/opt/cibervault/server.env"
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+    except FileNotFoundError:
+        pass
+_load_env()
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+
+from user_auth import (
+    create_default_admin, authenticate_user, create_jwt, get_current_user,
+    require_admin, require_analyst,
+    get_all_users, create_user, update_user, delete_user,
+    ROLES,
+)
+from models import (
+    EnrollRequest, EnrollResponse,
+    EventBatch, HeartbeatPayload,
+    CommandPollResponse, CommandResult,
+    DashboardEvent, AgentStatus,
+    IssueCommand,
+    SmtpConfigModel, FpExclusionModel, FpVerdictModel,
+    LoginRequest, CreateUserRequest, UpdateUserRequest,
+)
+from database import DB, init_db
+from auth import create_token, verify_token
+
+async def load_fp_exclusions():
+    """Load active FP exclusions from DB."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        try:
+            cur = await db.execute("SELECT * FROM fp_exclusions WHERE enabled=1")
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+from scoring import check_fp_exclusion, score_to_severity, infer_mitre_tactic
+from rules_engine import run_rules, get_builtin_rules, BUILTIN_RULES
+from api_agent_updates import router as updates_router, ensure_updates_schema
+from api_process_tree import router as ptree_router, ensure_ptree_schema
+from api_charts import router as charts_router
+from virustotal import vt_scan_hash, vt_scan_ip
+from ueba import get_ueba
+from vuln_scanner import scan_vulnerabilities, run_cis_checks, compliance_summary
+from ai_analyst import (analyze_event, generate_remediation, analyze_incident,
+                        hunt_query, generate_report, get_status, update_settings)
+# AI v2 — SOAR, Correlation, Rule Generation
+from api_ai_v2 import router as ai_v2_router, init_ai_v2
+from soar_engine import init_soar_db, evaluate_event, execute_pending_actions
+from ai_correlator import init_correlator_db
+from api_ueba_ai import router as ueba_ai_router, init_ueba_ai
+from api_server_response import router as server_response_router, init_server_response, start_expire_task
+from ai_ueba_intel import router as ueba_intel_router, init_ueba_intel
+from entity_resolution import router as entity_router, init_entity_resolution
+from syslog_receiver import start_syslog_server, syslog_to_event
+from email_service import send_alert_email, get_smtp_config, save_smtp_config, test_smtp_connection
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("cibervault.server")
+
+app = FastAPI(title="Cibervault EDR Server", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── WebSocket connection manager ────────────────────────────────────────────
+
+class ConnectionManager:
+    def __init__(self):
+        self.active: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+        log.info(f"Dashboard client connected. Total: {len(self.active)}")
+
+    def disconnect(self, ws: WebSocket):
+        self.active.remove(ws)
+
+    async def broadcast(self, data: dict):
+        dead = []
+        for ws in self.active:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.active.remove(ws)
+
+# ── Static files for enhancement modules ──
+import os as _os_static
+_static_dir = _os_static.path.join(_os_static.path.dirname(__file__), "static")
+if _os_static.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+# ── Chart API routes ──
+app.include_router(charts_router)
+app.include_router(ptree_router)
+app.include_router(updates_router)
+app.include_router(ai_v2_router)
+app.include_router(ueba_ai_router)
+app.include_router(server_response_router)
+app.include_router(ueba_intel_router)
+app.include_router(entity_router)
+
+manager = ConnectionManager()
+
+# ─── Startup ──────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+    # Load AI settings from DB
+    async with aiosqlite.connect(DB) as db_tmp:
+        try:
+            db_tmp.row_factory = aiosqlite.Row
+            cur = await db_tmp.execute("SELECT key, value FROM settings WHERE key LIKE 'ai_%'")
+            rows = await cur.fetchall()
+            ai_cfg = {r["key"].replace("ai_",""):r["value"] for r in rows}
+            if ai_cfg: update_settings(ai_cfg)
+        except Exception: pass
+    # Migrate new columns
+    async with aiosqlite.connect(DB) as db:
+        for col in [
+            "ALTER TABLE events ADD COLUMN mitre_id TEXT",
+            "ALTER TABLE events ADD COLUMN mitre_tactic TEXT",
+            "ALTER TABLE events ADD COLUMN rule_id TEXT",
+            "ALTER TABLE events ADD COLUMN rule_name TEXT",
+            "ALTER TABLE events ADD COLUMN win_event_id INTEGER",
+            "ALTER TABLE events ADD COLUMN source_ip TEXT",
+        ]:
+            try: await db.execute(col); await db.commit()
+            except Exception: pass
+    await create_default_admin()
+    # AI v2 init
+    await init_soar_db(DB)
+    await init_correlator_db(DB)
+    init_ai_v2(DB, get_current_user, require_admin)
+    init_ueba_ai(DB)
+    init_server_response(DB)
+    init_ueba_intel(DB)
+    init_entity_resolution(DB)
+    await start_expire_task()
+    await ensure_ptree_schema()
+    log.info("Cibervault server started. Database initialised.")
+
+
+# ─── Auth routes ──────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/auth/login")
+async def login(req: LoginRequest, request: Request):
+    user = await authenticate_user(req.username, req.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = create_jwt(user["id"], user["username"], user["role"])
+    # Audit log
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            INSERT INTO audit_log (actor, action, target, outcome, ip_address, created_at)
+            VALUES (?,?,?,?,?,?)
+        """, (user["username"], "login", "dashboard", "success",
+              request.client.host, datetime.utcnow().isoformat()))
+        await db.commit()
+    return {
+        "token":     token,
+        "user_id":   user["id"],
+        "username":  user["username"],
+        "full_name": user["full_name"],
+        "role":      user["role"],
+        "email":     user["email"],
+    }
+
+@app.get("/api/v1/auth/me")
+async def me(current_user: dict = Depends(get_current_user)):
+    return current_user
+
+@app.post("/api/v1/auth/logout")
+async def logout(current_user: dict = Depends(get_current_user), request: Request = None):
+    # Stateless JWT — just audit log it
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            INSERT INTO audit_log (actor, action, target, outcome, ip_address, created_at)
+            VALUES (?,?,?,?,?,?)
+        """, (current_user["username"], "logout", "dashboard", "success",
+              request.client.host if request else "unknown",
+              datetime.utcnow().isoformat()))
+        await db.commit()
+    return {"ok": True}
+
+
+# ─── User management routes ───────────────────────────────────────────────────
+
+@app.get("/api/v1/users")
+async def list_users(current_user: dict = Depends(require_admin)):
+    return await get_all_users()
+
+@app.post("/api/v1/users")
+async def add_user(req: CreateUserRequest,
+                   current_user: dict = Depends(require_admin)):
+    uid = await create_user(req.username, req.email, req.password,
+                            req.role, req.full_name or "")
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            INSERT INTO audit_log (actor, action, target, outcome, created_at)
+            VALUES (?,?,?,?,?)
+        """, (current_user["username"], "create_user",
+              req.username, "success", datetime.utcnow().isoformat()))
+        await db.commit()
+    return {"ok": True, "user_id": uid}
+
+@app.patch("/api/v1/users/{user_id}")
+async def edit_user(user_id: int, req: UpdateUserRequest,
+                    current_user: dict = Depends(require_admin)):
+    data = {k: v for k, v in req.model_dump().items() if v is not None}
+    await update_user(user_id, data)
+    return {"ok": True}
+
+@app.delete("/api/v1/users/{user_id}")
+async def remove_user(user_id: int,
+                      current_user: dict = Depends(require_admin)):
+    await delete_user(user_id, int(current_user["sub"]))
+    return {"ok": True}
+
+@app.get("/api/v1/roles")
+async def list_roles(current_user: dict = Depends(require_admin)):
+    return ROLES
+
+
+# ─── Dashboard UI ─────────────────────────────────────────────────────────────
+
+DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(__file__), "dashboard.html")
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/dashboard", response_class=HTMLResponse)
+async def serve_dashboard():
+    """Serve the Cibervault EDR dashboard UI."""
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
+    if os.path.exists(DASHBOARD_HTML_PATH):
+        with open(DASHBOARD_HTML_PATH, "r") as f:
+            content = f.read()
+        return HTMLResponse(content=content, headers=headers)
+    return HTMLResponse(content="<h1>Dashboard not found</h1>", status_code=404, headers=headers)
+
+# ─── Agent: Enrollment ────────────────────────────────────────────────────────
+
+@app.post("/api/v1/agent/enroll")
+async def enroll_agent(req: EnrollRequest):
+    """Enroll agent. Reuses existing agent_id if same hostname."""
+    try:
+        # Validate secret
+        expected = os.getenv("AGENT_SECRET", "")
+        if expected and req.agent_secret != expected:
+            raise HTTPException(status_code=401, detail="Wrong agent secret")
+
+        async with aiosqlite.connect(DB) as db:
+            db.row_factory = aiosqlite.Row
+
+            # Check for existing agent with same hostname
+            cur = await db.execute(
+                "SELECT agent_id FROM agents WHERE hostname=? LIMIT 1",
+                (req.hostname,)
+            )
+            row = await cur.fetchone()
+
+            if row:
+                agent_id = row["agent_id"]
+                await db.execute(
+                    """UPDATE agents SET os=?,os_version=?,ip_address=?,arch=?,
+                       agent_version=?,last_seen=?,status='online' WHERE agent_id=?""",
+                    (req.os or "", req.os_version or "", req.ip_address or "",
+                     req.arch or "", req.agent_version or "2.0",
+                     datetime.utcnow().isoformat(), agent_id)
+                )
+                log.info(f"Re-enrolled: {req.hostname} [{agent_id[:8]}]")
+            else:
+                agent_id = str(uuid.uuid4())
+                await db.execute(
+                    """INSERT INTO agents
+                       (agent_id,hostname,os,os_version,ip_address,arch,
+                        agent_version,group_name,enrolled_at,last_seen,status)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (agent_id, req.hostname, req.os or "", req.os_version or "",
+                     req.ip_address or "", req.arch or "", req.agent_version or "2.0",
+                     req.group or "default",
+                     datetime.utcnow().isoformat(),
+                     datetime.utcnow().isoformat(), "online")
+                )
+                log.info(f"Enrolled new: {req.hostname} [{agent_id[:8]}]")
+
+            await db.commit()
+
+        token = create_token(agent_id)
+        return {"agent_id": agent_id, "token": token, "status": "enrolled", "server_time": datetime.utcnow().isoformat()}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log.error(f"Enroll CRASH [{req.hostname}]: {e}\n{tb}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+
+@app.post("/api/v1/agent/events")
+async def ingest_events(batch: EventBatch, authorization: str = Header(...)):
+    """Receive a batch of telemetry events from an agent."""
+    agent_id = verify_token(authorization)
+
+    # Load FP exclusions + custom rules once per batch
+    fp_exclusions = await load_fp_exclusions()
+    smtp_cfg      = await get_smtp_config()
+
+    # Load custom rules from DB
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM detection_rules WHERE enabled=1 AND is_override=0")
+        custom_rules_raw = [dict(r) for r in await cur.fetchall()]
+        # Load overrides
+        cur2 = await db.execute(
+            "SELECT * FROM detection_rules WHERE is_override=1")
+        overrides = {r["rule_id"]: dict(r) for r in await cur2.fetchall()}
+
+    # Apply overrides to builtin rules
+    from rules_engine import BUILTIN_RULES as _BR
+    effective_builtin = []
+    for r in _BR:
+        if r["rule_id"] in overrides:
+            ov = overrides[r["rule_id"]]
+            merged = {**r, 
+                      "base_score": ov.get("base_score", r["base_score"]),
+                      "enabled": bool(ov.get("enabled", 1))}
+            effective_builtin.append(merged)
+        else:
+            effective_builtin.append(r)
+
+    custom_rules = []
+    for cr in custom_rules_raw:
+        try:
+            et = json.loads(cr.get("event_types","[]"))
+        except Exception:
+            et = []
+        custom_rules.append({**cr, "event_types": et, "builtin": False})
+
+    alerts_triggered = 0
+    now = datetime.utcnow()
+
+    async with aiosqlite.connect(DB) as db:
+        for ev in batch.events:
+            etype      = ev.get("event_type","unknown")
+            event_time = ev.get("event_time", now.isoformat())
+            hostname   = (ev.get("host") or {}).get("hostname","") or ev.get("hostname","")
+            payload    = ev
+
+            # Extract MITRE info from event
+            mitre_id     = ev.get("mitre_technique","") or ev.get("mitre_id","")
+            mitre_tactic = ev.get("mitre_tactic","")
+            is_suspicious = ev.get("is_suspicious", False)
+            source_ip    = ev.get("source_ip","")
+            win_event_id = None
+
+            # Extract source IP and Windows event ID
+            if ev.get("win_event"):
+                win_event_id = ev["win_event"].get("event_id")
+                source_ip    = ev["win_event"].get("source_ip","")
+                if not mitre_id: mitre_id = ev.get("mitre_technique","")
+            if ev.get("auth"):
+                source_ip = ev["auth"].get("source_ip","")
+            if ev.get("network"):
+                source_ip = ev["network"].get("dst_ip","") or ev["network"].get("remote_address","")
+
+            # ── Run rules engine ──────────────────────────────────────────
+            matched_rules = run_rules(agent_id, ev, custom_rules)
+
+            # Use highest scoring matched rule
+            top_rule = None
+            if matched_rules:
+                top_rule = max(matched_rules, key=lambda r: r.get("final_score",0))
+                is_suspicious = True
+                mitre_id     = top_rule.get("mitre_id", mitre_id)
+                mitre_tactic = top_rule.get("mitre_tactic", mitre_tactic)
+
+            # ── FP exclusion check ────────────────────────────────────────
+            fp_dampener = 1.0
+            for excl in fp_exclusions:
+                exc_type = excl.get("event_type","")
+                exc_val  = excl.get("value","").lower()
+                proc = (payload.get("process") or {})
+                pname = (proc.get("name") or "").lower()
+                cmdline = (proc.get("cmdline") or "").lower()
+                if exc_type in ("process_name","*") and exc_val and exc_val in pname:
+                    fp_dampener = 0.0
+                    is_suspicious = False
+                    break
+                if exc_type == "cmdline" and exc_val and exc_val in cmdline:
+                    fp_dampener = 0.0
+                    is_suspicious = False
+                    break
+
+            # ── Score ─────────────────────────────────────────────────────
+            if top_rule:
+                risk_score = int(top_rule.get("final_score",0) * fp_dampener)
+                severity   = top_rule.get("severity","low")
+            else:
+                risk_score = 0
+                severity   = "info"
+                if is_suspicious:
+                    risk_score = 25
+                    severity   = "low"
+
+            event_id = ev.get("event_id", str(uuid.uuid4()))
+
+            # ── Store event ───────────────────────────────────────────────
+            await db.execute("""
+                INSERT OR IGNORE INTO events
+                (event_id, agent_id, event_type, event_time, hostname,
+                 severity, risk_score, is_suspicious, payload,
+                 mitre_id, mitre_tactic, rule_id, rule_name,
+                 win_event_id, source_ip, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                event_id, agent_id, etype, event_time, hostname,
+                severity, risk_score, 1 if is_suspicious else 0,
+                json.dumps(payload),
+                mitre_id, mitre_tactic,
+                top_rule.get("rule_id","") if top_rule else "",
+                top_rule.get("name","") if top_rule else "",
+                win_event_id, source_ip,
+                datetime.utcnow().isoformat(),
+            ))
+
+            # ── Email alert ───────────────────────────────────────────────
+            if is_suspicious and risk_score >= 60 and smtp_cfg and fp_dampener > 0:
+                alerts_triggered += 1
+                try:
+                    await send_alert_email(smtp_cfg, {
+                        "event_id": event_id, "agent_id": agent_id,
+                        "event_type": etype, "hostname": hostname,
+                        "severity": severity, "risk_score": risk_score,
+                        "rule_name": top_rule.get("name","") if top_rule else etype,
+                        "mitre_id": mitre_id, "mitre_tactic": mitre_tactic,
+                    })
+                except Exception as email_err:
+                    log.debug(f"Email alert failed: {email_err}")
+
+            # ── UEBA behavioral analysis ─────────────────────────────────
+            ueba_alerts = get_ueba().process_event(agent_id, hostname, ev)
+            for ua in ueba_alerts:
+                ua_id = str(uuid.uuid4())
+                await db.execute("""
+                    INSERT OR IGNORE INTO events
+                    (event_id, agent_id, event_type, event_time, hostname,
+                     severity, risk_score, is_suspicious, payload,
+                     mitre_id, mitre_tactic, rule_id, rule_name, source_ip, created_at)
+                    VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)
+                """, (
+                    ua_id, agent_id, "ueba_alert",
+                    ua["timestamp"], hostname,
+                    ua["severity"], ua["risk_score"],
+                    json.dumps(ua),
+                    ua.get("mitre_id",""), ua.get("mitre_tactic",""),
+                    "UEBA-"+ua["ueba_type"].upper()[:20],
+                    ua["description"][:120],
+                    ua.get("context",{}).get("src_ip",""),
+                    datetime.utcnow().isoformat(),
+                ))
+                alerts_triggered += 1
+                await manager.broadcast({"type": "alert", "data": {
+                    "agent_id":    agent_id,
+                    "hostname":    hostname,
+                    "event_type":  "ueba_alert",
+                    "severity":    ua["severity"],
+                    "risk_score":  ua["risk_score"],
+                    "rule_id":     "UEBA",
+                    "rule_name":   ua["description"][:80],
+                    "mitre_id":    ua.get("mitre_id",""),
+                    "mitre_tactic": ua.get("mitre_tactic",""),
+                }})
+
+            # ── Broadcast to dashboard via WebSocket ──────────────────────
+            if is_suspicious and risk_score >= 40:
+                await manager.broadcast({"type": "alert", "data": {
+                    "agent_id":    agent_id,
+                    "hostname":    hostname,
+                    "event_type":  etype,
+                    "severity":    severity,
+                    "risk_score":  risk_score,
+                    "rule_id":     top_rule.get("rule_id","") if top_rule else "",
+                    "rule_name":   top_rule.get("name","") if top_rule else "",
+                    "mitre_id":    mitre_id,
+                    "mitre_tactic": mitre_tactic,
+                }})
+
+        await db.execute(
+            "UPDATE agents SET last_seen=?, status='online' WHERE agent_id=?",
+            (now.isoformat(), agent_id))
+        await db.commit()
+
+    return {"ok": True, "events_stored": len(batch.events), "alerts_triggered": alerts_triggered}
+
+@app.post("/api/v1/agent/heartbeat")
+async def heartbeat(hb: HeartbeatPayload, authorization: str = Header(...)):
+    agent_id = verify_token(authorization)
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            UPDATE agents SET last_seen=?, status='online',
+            cpu_pct=?, mem_pct=?, disk_pct=?, agent_version=?,
+            ip_address=COALESCE(NULLIF(ip_address,''), ip_address)
+            WHERE agent_id=?
+        """, (
+            datetime.utcnow().isoformat(),
+            float(hb.cpu_pct or 0), float(hb.mem_pct or 0),
+            float(hb.disk_pct or 0), hb.agent_version or "2.0",
+            agent_id
+        ))
+        await db.commit()
+
+    await manager.broadcast({"type": "heartbeat", "data": {
+        "agent_id": agent_id, "time": datetime.utcnow().isoformat(),
+        "cpu": hb.cpu_pct, "mem": hb.mem_pct,
+    }})
+    return {"ok": True}
+
+# ─── Agent: Command polling ───────────────────────────────────────────────────
+
+@app.get("/api/v1/agent/commands", response_model=CommandPollResponse)
+async def poll_commands(authorization: str = Header(...)):
+    agent_id = verify_token(authorization)
+
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("""
+            SELECT command_id, command_type, parameters, issued_by, expires_at
+            FROM commands
+            WHERE agent_id=? AND status IN ('pending','delivered') AND expires_at > ?
+        """, (agent_id, datetime.utcnow().isoformat()))
+        rows = await cur.fetchall()
+
+    if not rows:
+        return CommandPollResponse(commands=[])
+
+    command_ids = [r[0] for r in rows]
+    commands = [
+        {"command_id": r[0], "command_type": r[1],
+         "parameters": json.loads(r[2] or "{}"), "issued_by": r[3]}
+        for r in rows
+    ]
+
+    # Mark as delivered so they don't get re-sent on next poll
+    async with aiosqlite.connect(DB) as db:
+        for cid in command_ids:
+            await db.execute(
+                "UPDATE commands SET status='delivered' WHERE command_id=? AND status='pending'",
+                (cid,)
+            )
+        await db.commit()
+
+    return CommandPollResponse(commands=commands)
+
+# ─── Agent: Command result ────────────────────────────────────────────────────
+
+@app.post("/api/v1/agent/command-result")
+async def command_result(request: Request, authorization: str = Header(...)):
+    agent_id = verify_token(authorization)
+    body     = await request.json()
+
+    # Accept BOTH flat format (output/error/status) and nested format (result/details)
+    # Flat format: {"command_id":..., "output":..., "error":..., "status":...}
+    # Nested format: {"command_id":..., "result":{"output":...,"error":...}}
+    command_id = body.get("command_id","")
+    if not command_id:
+        raise HTTPException(400, "command_id required")
+
+    # Try flat fields first (what our Linux/Windows agents send)
+    output    = body.get("output","")
+    error     = body.get("error","")
+    status    = body.get("status","")   # "completed" or "failed"
+    exit_code = body.get("exit_code", 0)
+
+    # Fall back to nested if flat is empty
+    if not output and not error:
+        nested_raw = body.get("result") or body.get("details") or {}
+    if isinstance(nested_raw, str):
+        output = nested_raw
+        nested = {}
+    else:
+        nested = nested_raw
+        output    = nested.get("output","")
+        error     = nested.get("error","")
+        exit_code = nested.get("exit_code", 0)
+
+    # Determine outcome
+    if status == "completed":
+        outcome = "success"
+    elif status == "failed":
+        outcome = "failure"
+    else:
+        outcome = "success" if not error else "failure"
+
+
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            UPDATE commands
+            SET status=?, result=?, completed_at=?
+            WHERE command_id=? AND agent_id=?
+        """, (
+            outcome,
+            json.dumps({"output": output, "error": error, "exit_code": exit_code}),
+            datetime.utcnow().isoformat(),
+            command_id, agent_id
+        ))
+        await db.commit()
+
+    # Broadcast result to dashboard via WebSocket
+    await manager.broadcast({"type": "command_result", "data": {
+        "command_id": command_id,
+        "outcome":    outcome,
+        "output":     output[:2000],
+        "error":      error[:500],
+        "agent_id":   agent_id,
+    }})
+    return {"ok": True}
+
+
+
+@app.get("/api/v1/commands/{command_id}")
+async def get_command_status(command_id: str, current_user: dict = Depends(get_current_user)):
+    """Get the status and result of a command."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM commands WHERE command_id=?", (command_id,)
+        )
+        row = await cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Command not found")
+    d = dict(row)
+    if d.get("result"):
+        try: d["result"] = json.loads(d["result"])
+        except: pass
+    return d
+
+# ─── Dashboard: Agent detail ──────────────────────────────────────────────────
+
+@app.get("/api/v1/agents/{agent_id}")
+async def get_agent_detail(agent_id: str,
+                           current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,))
+        agent = await cur.fetchone()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return dict(agent)
+
+@app.delete("/api/v1/agents/{agent_id}")
+async def delete_agent(agent_id: str,
+                       current_user: dict = Depends(require_analyst)):
+    """Permanently remove agent and ALL its data from the database."""
+    async with aiosqlite.connect(DB) as db:
+        # Get hostname for logging
+        cur = await db.execute("SELECT hostname FROM agents WHERE agent_id=?", (agent_id,))
+        row = await cur.fetchone()
+        hostname = row[0] if row else agent_id[:8]
+
+        # Delete everything related to this agent
+        await db.execute("DELETE FROM agents   WHERE agent_id=?", (agent_id,))
+        await db.execute("DELETE FROM events   WHERE agent_id=?", (agent_id,))
+        await db.execute("DELETE FROM commands WHERE agent_id=?", (agent_id,))
+        await db.commit()
+
+    log.info(f"Agent permanently removed: {hostname} [{agent_id[:8]}] by {current_user.get('username','?')}")
+    await manager.broadcast({"type": "agent_removed", "data": {"agent_id": agent_id, "hostname": hostname}})
+    return {"ok": True, "message": f"Agent {hostname} permanently removed"}
+
+@app.get("/api/v1/agents/{agent_id}/events")
+async def get_agent_events(agent_id: str, limit: int = 100,
+                           current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT event_id, event_type, event_time, hostname, severity,
+                   risk_score, score_breakdown, is_suspicious,
+                   is_fp, fp_verdict, payload, created_at
+            FROM events WHERE agent_id=?
+            ORDER BY event_time DESC LIMIT ?
+        """, (agent_id, limit))
+        rows = await cur.fetchall()
+    result = []
+    for r in rows:
+        row = dict(r)
+        if row.get("score_breakdown"):
+            try: row["score_breakdown"] = json.loads(row["score_breakdown"])
+            except: pass
+        # Parse process name from payload for display
+        try:
+            payload = json.loads(row.get("payload") or "{}")
+            row["process_name"] = payload.get("process", {}).get("name", "")
+            row["network_dst"]  = payload.get("network", {}).get("dst_ip", "")
+        except: pass
+        result.append(row)
+    return result
+
+@app.get("/api/v1/agents/{agent_id}/commands")
+async def get_agent_commands(agent_id: str, limit: int = 50,
+                             current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT command_id, command_type, parameters, status,
+                   result, issued_by, created_at as issued_at, completed_at
+            FROM commands WHERE agent_id=?
+            ORDER BY created_at DESC LIMIT ?
+        """, (agent_id, limit))
+        rows = await cur.fetchall()
+    result = []
+    for r in rows:
+        row = dict(r)
+        if row.get("result"):
+            try: row["result"] = json.loads(row["result"])
+            except: pass
+        if row.get("parameters"):
+            try: row["parameters"] = json.loads(row["parameters"])
+            except: pass
+        result.append(row)
+    return result
+
+# ─── Dashboard: Command results poll (for live result display) ────────────────
+
+@app.get("/api/v1/commands/{command_id}/result")
+async def get_command_result(command_id: str,
+                             current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT command_id, command_type, status, result, completed_at, agent_id
+            FROM commands WHERE command_id=?
+        """, (command_id,))
+        row = await cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Command not found")
+    r = dict(row)
+    if r.get("result"):
+        try: r["result"] = json.loads(r["result"])
+        except: pass
+    return r
+
+# ─── Dashboard: WebSocket live feed ───────────────────────────────────────────
+
+@app.websocket("/ws/live")
+async def websocket_live(ws: WebSocket):
+    await manager.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()   # keep-alive pings
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
+
+# ─── Dashboard: Events query ──────────────────────────────────────────────────
+
+@app.get("/api/v1/dashboard/events")
+async def get_events(
+    limit:        int = 100,
+    offset:       int = 0,
+    severity:     str = "",
+    event_type:   str = "",
+    agent_id:     str = "",
+    hostname:     str = "",
+    mitre_tactic: str = "",
+    rule_id:      str = "",
+    q:            str = "",
+    is_suspicious: str = "",
+    current_user: dict = Depends(get_current_user)
+):
+    """Query events with full filtering."""
+    conditions = ["1=1"]
+    params = []
+
+    if severity:
+        conditions.append("severity=?"); params.append(severity)
+    if event_type:
+        conditions.append("event_type=?"); params.append(event_type)
+    if agent_id:
+        conditions.append("agent_id=?"); params.append(agent_id)
+    if hostname:
+        conditions.append("hostname LIKE ?"); params.append(f"%{hostname}%")
+    if mitre_tactic:
+        conditions.append("mitre_tactic LIKE ?"); params.append(f"%{mitre_tactic}%")
+    if rule_id:
+        conditions.append("rule_id LIKE ?"); params.append(f"%{rule_id}%")
+    if is_suspicious:
+        conditions.append("is_suspicious=?"); params.append(1 if is_suspicious.lower()=="true" else 0)
+    if q:
+        conditions.append(
+            "(hostname LIKE ? OR event_type LIKE ? OR rule_name LIKE ? OR mitre_id LIKE ? OR payload LIKE ?)"
+        )
+        like = f"%{q}%"
+        params.extend([like, like, like, like, like])
+
+    where = " AND ".join(conditions)
+    params.extend([limit, offset])
+
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(f"""
+            SELECT event_id, agent_id, event_type, event_time, hostname,
+                   severity, risk_score, is_suspicious, is_fp, fp_verdict,
+                   mitre_id, mitre_tactic, rule_id, rule_name,
+                   win_event_id, source_ip, payload
+            FROM events
+            WHERE {where}
+            ORDER BY event_time DESC
+            LIMIT ? OFFSET ?
+        """, params)
+        rows = await cur.fetchall()
+
+    result = []
+    for r in rows:
+        row = dict(r)
+        if row.get("payload"):
+            try: row["payload"] = json.loads(row["payload"])
+            except: pass
+        result.append(row)
+    return result
+
+@app.get("/api/v1/dashboard/agents")
+async def get_agents():
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT agent_id, hostname, os, os_version, ip_address,
+                   arch, agent_version, group_name, enrolled_at,
+                   last_seen, status, cpu_pct, mem_pct, disk_pct
+            FROM agents ORDER BY last_seen DESC
+        """)
+        rows = await cur.fetchall()
+
+    agents = []
+    now = datetime.utcnow()
+    for r in rows:
+        d = dict(r)
+        # Recompute online/offline based on last_seen (online = heartbeat < 90s ago)
+        try:
+            ls = datetime.fromisoformat(d["last_seen"].replace("Z",""))
+            d["status"] = "online" if (now - ls).total_seconds() < 150 else "offline"
+        except Exception:
+            d["status"] = "offline"
+        agents.append(d)
+    return agents
+
+# ─── Dashboard: Alert summary ─────────────────────────────────────────────────
+
+@app.get("/api/v1/dashboard/summary")
+async def get_summary():
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+
+        total_agents  = (await (await db.execute("SELECT COUNT(*) FROM agents")).fetchone())[0]
+        online_agents = (await (await db.execute(
+            "SELECT COUNT(*) FROM agents WHERE last_seen > datetime('now', '-150 seconds')"
+        )).fetchone())[0]
+        total_events  = (await (await db.execute("SELECT COUNT(*) FROM events")).fetchone())[0]
+        alerts_24h    = (await (await db.execute("""
+            SELECT COUNT(*) FROM events
+            WHERE is_suspicious=1 AND created_at > ?
+        """, ((datetime.utcnow() - timedelta(hours=24)).isoformat(),))).fetchone())[0]
+
+        by_severity   = await (await db.execute("""
+            SELECT severity, COUNT(*) as cnt FROM events
+            WHERE is_suspicious=1 GROUP BY severity
+        """)).fetchall()
+
+    return {
+        "total_agents":  total_agents,
+        "online_agents": online_agents,
+        "total_events":  total_events,
+        "alerts_24h":    alerts_24h,
+        "by_severity":   [dict(r) for r in by_severity],
+    }
+
+# ─── Dashboard: Issue command ─────────────────────────────────────────────────
+
+@app.post("/api/v1/dashboard/issue-command")
+async def issue_command(cmd: IssueCommand):
+    command_id = str(uuid.uuid4())
+    expires_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            INSERT INTO commands
+            (command_id, agent_id, command_type, parameters, issued_by, status, created_at, expires_at)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            command_id, cmd.agent_id, cmd.command_type,
+            json.dumps(cmd.parameters or {}),
+            cmd.issued_by or "dashboard", "pending",
+            datetime.utcnow().isoformat(), expires_at
+        ))
+        await db.commit()
+
+    return {"command_id": command_id, "status": "queued"}
+
+# ─── Detection engine ─────────────────────────────────────────────────────────
+
+SUSPICIOUS_CMDLINE = [
+    "-enc", "-encodedcommand", "-nop", "-noprofile", "-w hidden",
+    "invoke-expression", "iex", "downloadstring", "webclient",
+    "mimikatz", "sekurlsa", "lsadump", "bypass", "amsiutils",
+    "certutil -decode", "certutil -urlcache",
+    "bitsadmin /transfer", "regsvr32 /s /n /u /i:",
+    "mshta http", "wscript", "cscript",
+    "net user /add", "net localgroup administrators",
+    "vssadmin delete shadows", "wbadmin delete",
+    "bcdedit /set recoveryenabled no",
+    "schtasks /create", "at.exe",
+    "whoami /all", "nltest /domain_trusts",
+]
+
+SUSPICIOUS_PROCS = [
+    "mimikatz.exe", "procdump.exe", "wce.exe",
+    "pwdump", "fgdump", "gsecdump",
+    "meterpreter", "cobaltstrike", "cobalt_strike",
+]
+
+MALICIOUS_PORTS = {4444, 1337, 31337, 8888, 9999, 6666, 5555}
+MALICIOUS_IPS   = {"185.220.101.47", "45.142.212.100", "23.129.64.0"}
+
+def detect(ev: dict) -> tuple[bool, str]:
+    """Simple detection rules. Returns (is_suspicious, severity)."""
+    ev_type = ev.get("event_type", "")
+    process = ev.get("process", {})
+    network = ev.get("network", {})
+    auth    = ev.get("auth", {})
+
+    cmdline  = (process.get("cmdline") or "").lower()
+    procname = (process.get("name") or "").lower()
+    dst_ip   = network.get("dst_ip", "")
+    dst_port = network.get("dst_port", 0)
+    parent   = (process.get("parent_name") or "").lower()
+
+    # Critical: known C2 IP
+    if dst_ip in MALICIOUS_IPS:
+        return True, "critical"
+
+    # Critical: office app spawning shell
+    office_parents = {"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "acrord32.exe"}
+    shell_children = {"powershell.exe", "cmd.exe", "wscript.exe", "mshta.exe", "cscript.exe"}
+    if parent in office_parents and procname in shell_children:
+        return True, "critical"
+
+    # Critical: known malware process names
+    for mp in SUSPICIOUS_PROCS:
+        if mp in procname:
+            return True, "critical"
+
+    # High: suspicious cmdline flags
+    for pattern in SUSPICIOUS_CMDLINE:
+        if pattern in cmdline:
+            return True, "high"
+
+    # High: malicious destination port
+    if dst_port in MALICIOUS_PORTS:
+        return True, "high"
+
+    # High: failed logins burst (brute force signal)
+    if ev_type == "auth_failure" and auth.get("failure_count", 0) >= 5:
+        return True, "high"
+
+    # Medium: encoded powershell
+    if "powershell" in procname and ("-enc" in cmdline or "base64" in cmdline):
+        return True, "medium"
+
+    # Medium: new cron/service created
+    if ev_type in ("cron_create", "service_create", "scheduled_task_create"):
+        return True, "medium"
+
+    # Low: privilege escalation indicators
+    if ev_type == "privilege_escalation":
+        return True, "low"
+
+    return False, "info"
+
+
+
+
+# ─── SMTP Configuration ───────────────────────────────────────────────────────
+
+@app.get("/api/v1/settings/smtp")
+async def get_smtp():
+    cfg = await get_smtp_config()
+    if cfg and cfg.get("password"):
+        cfg["password"] = "••••••••"   # never expose password
+    return cfg or {}
+
+@app.post("/api/v1/settings/smtp")
+async def update_smtp(cfg: SmtpConfigModel):
+    await save_smtp_config(cfg.model_dump())
+    return {"ok": True}
+
+@app.post("/api/v1/settings/smtp/test")
+async def smtp_test(cfg: SmtpConfigModel):
+    ok, msg = await test_smtp_connection(cfg.model_dump())
+    return {"ok": ok, "message": msg}
+
+@app.post("/api/v1/settings/smtp/send-test")
+async def smtp_send_test(cfg: SmtpConfigModel):
+    """Send a real test email with dummy alert data."""
+    dummy_alert = {
+        "event_id": "test-001",
+        "agent_id": "test-agent",
+        "event_type": "test_alert",
+        "event_time": datetime.utcnow().isoformat(),
+        "hostname": "TEST-HOST",
+        "process": {"name": "test.exe", "pid": 1234, "cmdline": "test --verify-email",
+                    "parent_name": "explorer.exe", "user": "DOMAIN\\testuser"},
+        "network": {},
+    }
+    dummy_score = {
+        "score": 75.0, "severity_band": "high",
+        "breakdown": {"base_score": 70, "mitre_tactic": "execution",
+                      "mitre_weight": 0.8, "asset_criticality": "medium",
+                      "asset_weight": 1.1, "frequency_count": 1, "frequency_boost": 1.0}
+    }
+    ok, msg = await send_alert_email(dummy_alert, dummy_score, cfg.model_dump())
+    return {"ok": ok, "message": msg}
+
+
+# ─── False Positive Exclusions ────────────────────────────────────────────────
+
+@app.get("/api/v1/settings/fp-exclusions")
+async def list_fp_exclusions():
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM fp_exclusions ORDER BY created_at DESC"
+        )
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+@app.post("/api/v1/settings/fp-exclusions")
+async def create_fp_exclusion(excl: FpExclusionModel):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            INSERT INTO fp_exclusions
+            (name, description, hostname, process_name, cmdline_contains,
+             event_type, source_event_id, active, created_by, created_at)
+            VALUES (?,?,?,?,?,?,?,1,?,?)
+        """, (
+            excl.name, excl.description, excl.hostname, excl.process_name,
+            excl.cmdline_contains, excl.event_type, excl.source_event_id,
+            excl.created_by or "analyst", datetime.utcnow().isoformat()
+        ))
+        await db.commit()
+    return {"ok": True}
+
+@app.delete("/api/v1/settings/fp-exclusions/{excl_id}")
+async def delete_fp_exclusion(excl_id: int):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "UPDATE fp_exclusions SET active=0 WHERE id=?", (excl_id,)
+        )
+        await db.commit()
+    return {"ok": True}
+
+@app.post("/api/v1/events/{event_id}/verdict")
+async def set_event_verdict(event_id: str, verdict: FpVerdictModel):
+    """
+    Mark an event as true_positive, false_positive, or benign.
+    If false_positive: optionally create an exclusion rule to suppress similar future events.
+    """
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            UPDATE events
+            SET is_fp=?, fp_verdict=?, fp_marked_by=?, fp_marked_at=?
+            WHERE event_id=?
+        """, (
+            1 if verdict.verdict == "false_positive" else 0,
+            verdict.verdict,
+            verdict.marked_by or "analyst",
+            datetime.utcnow().isoformat(),
+            event_id
+        ))
+
+        # Auto-create exclusion rule when marked as FP
+        if verdict.verdict == "false_positive" and verdict.create_exclusion:
+            # Load the original event to build the exclusion
+            cur = await db.execute(
+                "SELECT payload, hostname, event_type FROM events WHERE event_id=?",
+                (event_id,)
+            )
+            row = await cur.fetchone()
+            if row:
+                payload_str, hostname, ev_type = row
+                payload = json.loads(payload_str)
+                proc    = payload.get("process", {})
+
+                excl_name = f"FP: {proc.get('name','unknown')} on {hostname}"
+                await db.execute("""
+                    INSERT INTO fp_exclusions
+                    (name, description, hostname, process_name, cmdline_contains,
+                     event_type, source_event_id, active, created_by, created_at)
+                    VALUES (?,?,?,?,?,?,?,1,?,?)
+                """, (
+                    excl_name,
+                    f"Auto-created from FP verdict on event {event_id}",
+                    hostname if verdict.scope == "host" else None,
+                    proc.get("name") if verdict.match_process else None,
+                    verdict.cmdline_pattern or None,
+                    ev_type if verdict.match_event_type else None,
+                    event_id,
+                    verdict.marked_by or "analyst",
+                    datetime.utcnow().isoformat()
+                ))
+
+        await db.commit()
+
+    await manager.broadcast({"type": "verdict_update", "data": {
+        "event_id": event_id,
+        "verdict":  verdict.verdict,
+    }})
+    return {"ok": True}
+
+
+# ─── Scoreboard ───────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/dashboard/scoreboard")
+async def scoreboard(limit: int = 25):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT e.event_id,e.hostname,e.event_type,e.severity,
+                   COALESCE(e.risk_score,0) as risk_score,
+                   e.mitre_id,e.mitre_tactic,e.rule_name,e.event_time,
+                   a.os,a.ip_address
+            FROM events e LEFT JOIN agents a ON e.agent_id=a.agent_id
+            WHERE e.is_suspicious=1
+            ORDER BY e.risk_score DESC LIMIT ?
+        """, (limit,))
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+@app.get("/api/v1/dashboard/score-distribution")
+async def score_distribution():
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT
+                SUM(CASE WHEN risk_score>=80 THEN 1 ELSE 0 END) as critical,
+                SUM(CASE WHEN risk_score>=60 AND risk_score<80 THEN 1 ELSE 0 END) as high,
+                SUM(CASE WHEN risk_score>=40 AND risk_score<60 THEN 1 ELSE 0 END) as medium,
+                SUM(CASE WHEN risk_score>0 AND risk_score<40 THEN 1 ELSE 0 END) as low,
+                SUM(CASE WHEN risk_score=0 THEN 1 ELSE 0 END) as info
+            FROM events WHERE is_suspicious=1
+        """)
+        row = await cur.fetchone()
+    return dict(row) if row else {}
+
+
+@app.get("/api/v1/dashboard/audit")
+async def get_audit(limit: int = 100, current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT id, actor, action, target, outcome, ip_address, detail, created_at
+            FROM audit_log ORDER BY created_at DESC LIMIT ?
+        """, (limit,))
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+
+
+# ─── Rules Management ────────────────────────────────────────────────────────
+
+@app.get("/api/v1/rules")
+async def get_rules(current_user: dict = Depends(get_current_user)):
+    """Get all rules - builtin + custom from DB."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM detection_rules ORDER BY rule_id")
+        custom = [dict(r) for r in await cur.fetchall()]
+    # Parse JSON fields
+    for r in custom:
+        if r.get("conditions"): 
+            try: r["conditions"] = json.loads(r["conditions"])
+            except: pass
+    return {"builtin": get_builtin_rules(), "custom": custom}
+
+@app.post("/api/v1/rules")
+async def create_rule(request: Request, current_user: dict = Depends(require_analyst)):
+    """Create a custom detection rule."""
+    body = await request.json()
+    rule_id = f"CUSTOM-{str(uuid.uuid4())[:8].upper()}"
+    now = datetime.utcnow().isoformat()
+    
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            INSERT INTO detection_rules 
+            (rule_id, name, description, event_types, severity, mitre_id, mitre_tactic,
+             base_score, match_field, match_pattern, enabled, created_by, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            rule_id,
+            body.get("name","Custom Rule"),
+            body.get("description",""),
+            json.dumps(body.get("event_types",[])),
+            body.get("severity","medium"),
+            body.get("mitre_id",""),
+            body.get("mitre_tactic",""),
+            int(body.get("base_score", 50)),
+            body.get("match_field","cmdline"),
+            body.get("match_pattern",""),
+            1,
+            current_user["username"],
+            now
+        ))
+        await db.commit()
+    log.info(f"Rule created: {rule_id} by {current_user['username']}")
+    return {"rule_id": rule_id, "status": "created"}
+
+@app.patch("/api/v1/rules/{rule_id}")
+async def update_rule(rule_id: str, request: Request, 
+                      current_user: dict = Depends(require_analyst)):
+    """Update a rule - custom or override builtin score/enabled."""
+    body = await request.json()
+    
+    # Check if it's a builtin rule override
+    is_builtin = any(r["rule_id"] == rule_id for r in BUILTIN_RULES)
+    
+    if is_builtin:
+        # Store override in DB
+        async with aiosqlite.connect(DB) as db:
+            # Check if override exists
+            cur = await db.execute(
+                "SELECT rule_id FROM detection_rules WHERE rule_id=?", (rule_id,))
+            existing = await cur.fetchone()
+            if existing:
+                # Update override
+                fields = []
+                vals = []
+                for field in ["base_score","enabled","name","description","severity"]:
+                    if field in body:
+                        fields.append(f"{field}=?")
+                        vals.append(body[field])
+                if fields:
+                    vals.append(rule_id)
+                    await db.execute(
+                        f"UPDATE detection_rules SET {','.join(fields)} WHERE rule_id=?",
+                        vals)
+            else:
+                # Create override record
+                builtin = next(r for r in BUILTIN_RULES if r["rule_id"] == rule_id)
+                await db.execute("""
+                    INSERT INTO detection_rules
+                    (rule_id, name, description, event_types, severity, mitre_id, mitre_tactic,
+                     base_score, enabled, is_override, created_by, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,1,?,?)
+                """, (
+                    rule_id,
+                    body.get("name", builtin["name"]),
+                    body.get("description", builtin["description"]),
+                    json.dumps(builtin["event_types"]),
+                    body.get("severity", builtin["severity"]),
+                    builtin["mitre_id"],
+                    builtin["mitre_tactic"],
+                    int(body.get("base_score", builtin["base_score"])),
+                    1 if body.get("enabled", True) else 0,
+                    current_user["username"],
+                    datetime.utcnow().isoformat()
+                ))
+            await db.commit()
+        return {"rule_id": rule_id, "status": "override saved"}
+    else:
+        # Update custom rule
+        async with aiosqlite.connect(DB) as db:
+            fields = []
+            vals = []
+            allowed = ["name","description","severity","base_score",
+                      "match_field","match_pattern","enabled","mitre_id","mitre_tactic"]
+            for f in allowed:
+                if f in body:
+                    fields.append(f"{f}=?")
+                    vals.append(body[f])
+            if fields:
+                vals.append(rule_id)
+                await db.execute(
+                    f"UPDATE detection_rules SET {','.join(fields)} WHERE rule_id=?",
+                    vals)
+                await db.commit()
+        return {"rule_id": rule_id, "status": "updated"}
+
+@app.delete("/api/v1/rules/{rule_id}")
+async def delete_rule(rule_id: str, current_user: dict = Depends(require_analyst)):
+    """Delete a custom rule (builtin rules cannot be deleted, only disabled)."""
+    if any(r["rule_id"] == rule_id for r in BUILTIN_RULES):
+        raise HTTPException(status_code=400, detail="Cannot delete builtin rules - use PATCH to disable")
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM detection_rules WHERE rule_id=?", (rule_id,))
+        await db.commit()
+    return {"status": "deleted"}
+
+@app.get("/api/v1/rules/stats")
+async def rules_stats(current_user: dict = Depends(get_current_user)):
+    """Rule hit statistics."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT rule_id, COUNT(*) as hits, MAX(event_time) as last_hit
+            FROM events WHERE rule_id IS NOT NULL
+            GROUP BY rule_id ORDER BY hits DESC LIMIT 20
+        """)
+        rows = [dict(r) for r in await cur.fetchall()]
+    return rows
+
+
+
+
+
+# ─── Vulnerability Detection ──────────────────────────────────────────────────
+
+@app.get("/api/v1/vulnerabilities")
+async def get_vulnerabilities(agent_id: str = "", current_user: dict = Depends(get_current_user)):
+    """Scan inventory against known CVEs."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT payload FROM events WHERE event_type='inventory'"
+        params = []
+        if agent_id:
+            query += " AND agent_id=?"
+            params.append(agent_id)
+        query += " ORDER BY event_time DESC LIMIT 10"
+        cur = await db.execute(query, params)
+        rows = await cur.fetchall()
+
+    all_software = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+            inv = payload.get("inventory", {})
+            all_software.extend(inv.get("software", []))
+        except Exception:
+            pass
+
+    # Deduplicate
+    seen = set()
+    unique_sw = []
+    for sw in all_software:
+        key = sw.get("name","") + sw.get("version","")
+        if key not in seen:
+            seen.add(key)
+            unique_sw.append(sw)
+
+    findings = scan_vulnerabilities(unique_sw)
+    return {
+        "total_packages": len(unique_sw),
+        "vulnerabilities": findings,
+        "critical_count": sum(1 for f in findings if f["severity"]=="critical"),
+        "high_count": sum(1 for f in findings if f["severity"]=="high"),
+        "scanned_at": datetime.utcnow().isoformat(),
+    }
+
+@app.get("/api/v1/compliance/cis")
+async def get_cis_compliance(current_user: dict = Depends(get_current_user)):
+    """Run CIS benchmark checks (Linux only)."""
+    import platform
+    if platform.system() != "Linux":
+        return {"error": "CIS checks only available on Linux server"}
+    results = run_cis_checks()
+    summary = compliance_summary(results)
+    return {"checks": results, "summary": summary}
+
+# ─── AI Analyst (Phase 4) ─────────────────────────────────────────────────────
+
+@app.get("/api/v1/ai/status")
+async def ai_status(current_user: dict = Depends(get_current_user)):
+    """Check AI backend status."""
+    from ai_analyst import _AI_SETTINGS, get_status
+    status = await get_status()
+    return status
+
+@app.post("/api/v1/ai/analyze-event")
+async def ai_analyze_event(request: Request, current_user: dict = Depends(get_current_user)):
+    """AI analysis of a single event."""
+    body = await request.json()
+    event_id = body.get("event_id","")
+    event    = body.get("event", {})
+
+    if event_id and not event:
+        async with aiosqlite.connect(DB) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM events WHERE event_id=?", (event_id,))
+            row = await cur.fetchone()
+            if row:
+                event = dict(row)
+                if event.get("payload"):
+                    try: event["payload"] = json.loads(event["payload"])
+                    except: pass
+
+    if not event:
+        raise HTTPException(404, "Event not found")
+
+    analysis = await analyze_event(event)
+    return analysis
+
+@app.post("/api/v1/ai/remediation-script")
+async def ai_remediation_script(request: Request, current_user: dict = Depends(require_analyst)):
+    """Generate AI remediation script for an event."""
+    body    = await request.json()
+    event   = body.get("event", {})
+    os_type = body.get("os_type", "windows")
+
+    if not event:
+        event_id = body.get("event_id","")
+        if event_id:
+            async with aiosqlite.connect(DB) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("SELECT * FROM events WHERE event_id=?", (event_id,))
+                row = await cur.fetchone()
+                if row:
+                    event = dict(row)
+
+    if not event:
+        raise HTTPException(404, "Event not found")
+
+    result = await generate_remediation(event, os_type)
+    return result
+
+@app.post("/api/v1/ai/analyze-incident")
+async def ai_analyze_incident(request: Request, current_user: dict = Depends(get_current_user)):
+    """AI analysis of multiple events as an incident."""
+    body     = await request.json()
+    event_ids = body.get("event_ids", [])
+    hostname  = body.get("hostname","")
+    limit     = body.get("limit", 20)
+
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        if event_ids:
+            placeholders = ",".join("?" * len(event_ids))
+            cur = await db.execute(
+                f"SELECT * FROM events WHERE event_id IN ({placeholders}) ORDER BY event_time",
+                event_ids
+            )
+        elif hostname:
+            cur = await db.execute(
+                "SELECT * FROM events WHERE hostname=? AND is_suspicious=1 ORDER BY event_time DESC LIMIT ?",
+                (hostname, limit)
+            )
+        else:
+            cur = await db.execute(
+                "SELECT * FROM events WHERE is_suspicious=1 ORDER BY event_time DESC LIMIT ?",
+                (limit,)
+            )
+        rows = [dict(r) for r in await cur.fetchall()]
+
+    analysis = await analyze_incident(rows)
+    return {"events_analyzed": len(rows), "analysis": analysis}
+
+@app.post("/api/v1/ai/threat-hunt")
+async def ai_threat_hunt(request: Request, current_user: dict = Depends(get_current_user)):
+    """Natural language threat hunting with AI."""
+    body  = await request.json()
+    query = body.get("query","")
+    if not query:
+        raise HTTPException(400, "query required")
+
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT event_type, hostname, severity, mitre_id, event_time FROM events ORDER BY event_time DESC LIMIT 200"
+        )
+        events = [dict(r) for r in await cur.fetchall()]
+
+    answer = await hunt_query(query, events)
+    return {"query": query, "answer": answer, "context_events": len(events)}
+
+@app.post("/api/v1/ai/incident-report")
+async def ai_incident_report(request: Request, current_user: dict = Depends(get_current_user)):
+    """Generate full incident report."""
+    body     = await request.json()
+    hostname = body.get("hostname","")
+    limit    = body.get("limit", 50)
+
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        if hostname:
+            cur = await db.execute(
+                "SELECT * FROM events WHERE hostname=? AND is_suspicious=1 ORDER BY event_time DESC LIMIT ?",
+                (hostname, limit)
+            )
+        else:
+            cur = await db.execute(
+                "SELECT * FROM events WHERE is_suspicious=1 ORDER BY event_time DESC LIMIT ?",
+                (limit,)
+            )
+        events = [dict(r) for r in await cur.fetchall()]
+
+    if not events:
+        raise HTTPException(404, "No events found")
+
+    incident = await analyze_incident(events)
+    report   = await generate_report(events)
+    return {"report": report, "incident": incident, "events_count": len(events)}
+
+@app.post("/api/v1/ai/configure")
+async def ai_configure(request: Request, current_user: dict = Depends(require_admin)):
+    """Configure AI backend (Ollama URL, model, or Anthropic key)."""
+    body = await request.json()
+    cfg  = {}
+    backend = body.get("backend", "ollama")
+
+    if "ollama_url" in body:
+        os.environ["OLLAMA_URL"] = body["ollama_url"]
+        cfg["ollama_url"] = body["ollama_url"]
+    if "ollama_model" in body:
+        os.environ["OLLAMA_MODEL"] = body["ollama_model"]
+        cfg["ollama_model"] = body["ollama_model"]
+    if "ollama_coder" in body:
+        os.environ["OLLAMA_CODER"] = body["ollama_coder"]
+        cfg["ollama_coder"] = body["ollama_coder"]
+    # Accept both "claude_key" (new dashboard) and "anthropic_key" (old)
+    api_key = body.get("claude_key") or body.get("anthropic_key","")
+    if api_key:
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+        cfg["anthropic_configured"] = True
+    if "claude_model" in body:
+        cfg["claude_model"] = body["claude_model"]
+    if backend:
+        os.environ["AI_BACKEND"] = backend
+        cfg["backend"] = backend
+    # Persist to DB and update AI module
+    async with aiosqlite.connect(DB) as db:
+        for key, val in body.items():
+            await db.execute("""
+                INSERT INTO settings (key, value, updated_at) VALUES (?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """, (f"ai_{key}", str(val), datetime.utcnow().isoformat()))
+        await db.commit()
+    update_settings(body)
+    return {"ok": True, "configured": cfg}
+
+# ─── Syslog receiver ──────────────────────────────────────────────────────────
+
+_syslog_events = []  # In-memory buffer for syslog events
+
+@app.get("/api/v1/syslog/stats")
+async def syslog_stats(current_user: dict = Depends(get_current_user)):
+    """Stats for syslog events received."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT COUNT(*) as total, MAX(event_time) as last_event
+            FROM events WHERE event_type LIKE 'syslog%'
+        """)
+        row = dict(await cur.fetchone())
+    return row
+
+
+
+# ─── Test / Demo Event Injection (admin only) ────────────────────────────────
+
+@app.post("/api/v1/test/inject")
+async def inject_test_events(request: Request, current_user: dict = Depends(get_current_user)):
+    """Inject test events directly into SIEM for demo/testing. Admin only."""
+    body     = await request.json()
+    events   = body.get("events", [])
+    agent_id = body.get("agent_id", "")
+
+    if not events:
+        raise HTTPException(400, "events list required")
+
+    # Verify agent exists
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT agent_id, hostname FROM agents WHERE agent_id=?", (agent_id,))
+        agent = await cur.fetchone()
+    if not agent:
+        raise HTTPException(404, f"Agent {agent_id} not found")
+
+    # Load rules
+    from rules_engine import BUILTIN_RULES
+    async with aiosqlite.connect(DB) as db2:
+        db2.row_factory = aiosqlite.Row
+        cur2 = await db2.execute("SELECT * FROM detection_rules WHERE enabled=1 AND is_override=0")
+        custom_rules_raw = [dict(r) for r in await cur2.fetchall()]
+    custom_rules = []
+    for cr in custom_rules_raw:
+        try: et = json.loads(cr.get("event_types","[]"))
+        except: et = []
+        custom_rules.append({**cr, "event_types": et, "builtin": False})
+
+    inserted = 0
+    alerts   = 0
+
+    async with aiosqlite.connect(DB) as db:
+        for ev in events:
+            etype        = ev.get("event_type", "test_event")
+            event_time   = ev.get("event_time", datetime.utcnow().isoformat())
+            hostname     = ev.get("hostname", agent[1])
+            mitre_id     = ev.get("mitre_technique", ev.get("mitre_id",""))
+            mitre_tactic = ev.get("mitre_tactic", "")
+            is_suspicious = ev.get("is_suspicious", True)
+            severity     = ev.get("severity", "high")
+            risk_score   = ev.get("risk_score", 70)
+            source_ip    = ev.get("source_ip", "")
+            description  = ev.get("description", "")
+            event_id     = ev.get("event_id", str(uuid.uuid4()))
+
+            # Run rules engine
+            matched = run_rules(agent_id, ev, custom_rules)
+            top_rule = max(matched, key=lambda r: r.get("final_score",0)) if matched else None
+            if top_rule:
+                is_suspicious = True
+                mitre_id     = top_rule.get("mitre_id", mitre_id)
+                mitre_tactic = top_rule.get("mitre_tactic", mitre_tactic)
+                risk_score   = max(risk_score, int(top_rule.get("final_score", risk_score)))
+                severity     = top_rule.get("severity", severity)
+
+            await db.execute("""
+                INSERT OR IGNORE INTO events
+                (event_id, agent_id, event_type, event_time, hostname,
+                 severity, risk_score, is_suspicious, payload,
+                 mitre_id, mitre_tactic, rule_id, rule_name, source_ip, created_at)
+                VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)
+            """, (
+                event_id, agent_id, etype, event_time, hostname,
+                severity, risk_score,
+                json.dumps({**ev, "injected_by": current_user.get("username","admin"), "description": description}),
+                mitre_id, mitre_tactic,
+                top_rule.get("rule_id","TEST") if top_rule else "TEST",
+                top_rule.get("name", description[:60]) if top_rule else description[:60],
+                source_ip,
+                datetime.utcnow().isoformat(),
+            ))
+            inserted += 1
+            if is_suspicious:
+                alerts += 1
+                await manager.broadcast({"type": "alert", "data": {
+                    "agent_id":   agent_id,
+                    "hostname":   hostname,
+                    "event_type": etype,
+                    "severity":   severity,
+                    "risk_score": risk_score,
+                    "rule_name":  description[:60],
+                    "mitre_id":   mitre_id,
+                }})
+        await db.commit()
+
+    return {"ok": True, "inserted": inserted, "alerts_triggered": alerts}
+
+
+
+
+@app.post("/api/v1/ai/chat")
+async def ai_chat(request: Request, current_user: dict = Depends(get_current_user)):
+    """AI Security Assistant — natural language chat with SIEM context."""
+    body    = await request.json()
+    message = body.get("message","").strip()
+    history = body.get("history", [])
+    if not message:
+        raise HTTPException(400, "message required")
+
+    # Gather COMPACT SIEM context (keep it small for CPU inference speed)
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT event_type, hostname, mitre_id, mitre_tactic, rule_name,
+                   severity, risk_score, source_ip, event_time
+            FROM events WHERE is_suspicious=1
+            ORDER BY event_time DESC LIMIT 8
+        """)
+        recent_alerts = [dict(r) for r in await cur.fetchall()]
+
+        cur2 = await db.execute("SELECT hostname, os, ip_address, status FROM agents LIMIT 5")
+        agents = [dict(r) for r in await cur2.fetchall()]
+
+        cur3 = await db.execute("""
+            SELECT severity, COUNT(*) as cnt
+            FROM events WHERE is_suspicious=1
+            AND event_time > datetime('now','-24 hours')
+            GROUP BY severity
+        """)
+        sev_counts = {r["severity"]: r["cnt"] for r in await cur3.fetchall()}
+
+        cur4 = await db.execute("""
+            SELECT mitre_tactic, COUNT(*) as cnt
+            FROM events WHERE mitre_tactic != '' AND is_suspicious=1
+            AND event_time > datetime('now','-24 hours')
+            GROUP BY mitre_tactic ORDER BY cnt DESC LIMIT 3
+        """)
+        top_tactics = [f"{r['mitre_tactic']}({r['cnt']})" for r in await cur4.fetchall()]
+
+    # Keep context SHORT for CPU speed
+    alert_lines = []
+    for a in recent_alerts:
+        line = f"- [{a['severity'].upper()}] {a['event_type']} on {a['hostname']}"
+        if a.get('source_ip'): line += f" from {a['source_ip']}"
+        if a.get('mitre_id'):  line += f" [{a['mitre_id']}]"
+        if a.get('rule_name'): line += f" — {a['rule_name'][:50]}"
+        alert_lines.append(line)
+
+    system_prompt = f"""You are a SOC analyst AI for Cibervault SIEM.
+Be CONCISE and DIRECT. Max 3-4 sentences unless asked for more.
+
+CURRENT STATUS:
+- Endpoints: {', '.join(a['hostname'] for a in agents)}
+- Alerts 24h: Critical:{sev_counts.get('critical',0)} High:{sev_counts.get('high',0)} Medium:{sev_counts.get('medium',0)}
+- Top tactics: {', '.join(top_tactics) or 'none'}
+
+RECENT ALERTS:
+{chr(10).join(alert_lines[:8])}
+
+Answer security questions based on this data. Be specific and actionable."""
+
+    messages = []
+    for h in history[-6:]:  # Only last 6 turns to save tokens
+        messages.append({"role": h["role"], "content": h["content"][:500]})  # truncate history
+    messages.append({"role": "user", "content": message})
+
+    from ai_analyst import call_llm, _AI_SETTINGS
+    if not _AI_SETTINGS.get("enabled"):
+        return {"reply": "AI not configured. Go to AI Analyst → Setup.", "error": True}
+
+    try:
+        if _AI_SETTINGS.get("backend") == "claude" and _AI_SETTINGS.get("claude_key"):
+            import aiohttp as aiohttp_mod
+            headers = {
+                "x-api-key": _AI_SETTINGS["claude_key"],
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            payload = {
+                "model": _AI_SETTINGS.get("claude_model","claude-haiku-4-5-20251001"),
+                "max_tokens": 800,
+                "system": system_prompt,
+                "messages": messages,
+            }
+            async with aiohttp_mod.ClientSession() as s:
+                async with s.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers, json=payload,
+                    timeout=aiohttp_mod.ClientTimeout(total=60)
+                ) as r:
+                    data  = await r.json()
+                    reply = data["content"][0]["text"] if r.status==200 else f"API error {r.status}"
+        else:
+            # Ollama: combine system + history + message into single prompt
+            full_prompt = system_prompt + "\n\n"
+            for h in history[-4:]:
+                role = "User" if h["role"]=="user" else "Assistant"
+                full_prompt += f"{role}: {h['content'][:300]}\n"
+            full_prompt += f"User: {message}\nAssistant:"
+            reply = await call_llm(full_prompt, "", max_tokens=400, task="chat")
+
+        return {"reply": reply, "context": {
+            "alerts_24h": sum(sev_counts.values()),
+            "top_tactics": top_tactics,
+        }}
+    except Exception as e:
+        log.error(f"AI chat error: {e}")
+        return {"reply": f"AI error: {e}", "error": True}
+
+
+@app.post("/api/v1/ai/auto-triage")
+async def ai_auto_triage(current_user: dict = Depends(get_current_user)):
+    """AI reviews critical/high alerts and provides triage summary."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT event_type, hostname, mitre_id, mitre_tactic,
+                   rule_name, severity, risk_score, source_ip, event_time
+            FROM events
+            WHERE is_suspicious=1 AND severity IN ('critical','high')
+            AND fp_verdict IS NULL
+            ORDER BY risk_score DESC LIMIT 10
+        """)
+        alerts = [dict(r) for r in await cur.fetchall()]
+
+    if not alerts:
+        return {"summary": "No critical/high alerts to triage. Environment looks clean.", "alerts": []}
+
+    # Compact format for speed
+    lines = []
+    for a in alerts:
+        line = f"[{a['severity'].upper()}] {a['event_type']} on {a['hostname']}"
+        if a.get('source_ip'): line += f" from {a['source_ip']}"
+        if a.get('mitre_id'):  line += f" [{a['mitre_id']}]"
+        if a.get('rule_name'): line += f" — {a['rule_name'][:40]}"
+        lines.append(line)
+
+    prompt = f"""SOC triage — {len(alerts)} critical/high alerts:
+
+{chr(10).join(lines)}
+
+Respond in this exact format (be brief):
+SUMMARY: [1-2 sentences on what is happening]
+PRIORITY 1: [most dangerous alert and why]
+PRIORITY 2: [second most dangerous]
+ATTACKER GOAL: [what they are trying to do]
+DO NOW: [top 3 immediate actions, numbered]
+FALSE POSITIVES: [any that look benign]"""
+
+    from ai_analyst import call_llm
+    try:
+        triage = await call_llm(prompt, "You are a SOC analyst. Be brief and direct.", 600, task="chat")
+        return {"summary": triage, "alert_count": len(alerts), "alerts": alerts[:5]}
+    except Exception as e:
+        return {"summary": f"Triage error: {e}", "alerts": []}
+
+
+@app.get("/api/v1/settings/{key}")
+async def get_setting(key: str, current_user: dict = Depends(get_current_user)):
+    """Get a persistent setting by key."""
+    allowed = {"wazuh","ai","smtp","general"}
+    if key not in allowed:
+        raise HTTPException(404, "Unknown setting key")
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        )
+        row = await cur.fetchone()
+    if not row:
+        return {}
+    try:
+        return json.loads(row["value"])
+    except Exception:
+        return {"value": row["value"]}
+
+@app.post("/api/v1/settings/{key}")
+async def save_setting(key: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """Save a persistent setting."""
+    allowed = {"wazuh","ai","smtp","general"}
+    if key not in allowed:
+        raise HTTPException(400, "Unknown setting key")
+    if current_user.get("role") not in ("admin","analyst"):
+        raise HTTPException(403, "Insufficient permissions")
+    body = await request.json()
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+            (key, json.dumps(body), datetime.utcnow().isoformat())
+        )
+        await db.commit()
+    return {"ok": True}
+
+# ─── Wazuh API Proxy ──────────────────────────────────────────────────────────
+# Browser can't reach 127.0.0.1:55000 directly — proxy through Cibervault server
+
+@app.post("/api/v1/wazuh/proxy/auth")
+async def wazuh_proxy_auth(request: Request, current_user: dict = Depends(get_current_user)):
+    """Get Wazuh API token via server-side proxy."""
+    import ssl as ssl_mod, base64 as b64_mod, aiohttp as aiohttp_mod
+    body = await request.json()
+    url  = body.get("url", "https://127.0.0.1:55000")
+    user = body.get("username", "wazuh-wui")
+    pwd  = body.get("password", "")
+    if not pwd:
+        raise HTTPException(400, "password required")
+    ssl_ctx = ssl_mod.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode    = ssl_mod.CERT_NONE
+    creds   = b64_mod.b64encode(f"{user}:{pwd}".encode()).decode()
+    headers = {"Authorization": f"Basic {creds}"}
+    try:
+        async with aiohttp_mod.ClientSession() as s:
+            async with s.post(
+                f"{url}/security/user/authenticate?raw=true",
+                headers=headers, ssl=ssl_ctx,
+                timeout=aiohttp_mod.ClientTimeout(total=10)
+            ) as r:
+                text = await r.text()
+                if r.status != 200:
+                    raise HTTPException(401, f"Wazuh auth failed: {text[:200]}")
+                return {"token": text.strip(), "url": url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Cannot reach Wazuh API at {url}: {e}")
+@app.get("/api/v1/wazuh/proxy/{path:path}")
+async def wazuh_proxy_get(path: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """Proxy GET requests to Wazuh API."""
+    import ssl as ssl_mod, aiohttp as aiohttp_mod
+    wazuh_url   = request.headers.get("X-Wazuh-URL", "https://127.0.0.1:55000")
+    wazuh_token = request.headers.get("X-Wazuh-Token", "")
+    if not wazuh_token:
+        raise HTTPException(401, "X-Wazuh-Token header required")
+    ssl_ctx = ssl_mod.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode    = ssl_mod.CERT_NONE
+    params  = dict(request.query_params)
+    headers = {"Authorization": f"Bearer {wazuh_token}"}
+    try:
+        async with aiohttp_mod.ClientSession() as s:
+            async with s.get(
+                f"{wazuh_url}/{path}",
+                headers=headers, params=params, ssl=ssl_ctx,
+                timeout=aiohttp_mod.ClientTimeout(total=15)
+            ) as r:
+                return await r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Wazuh proxy error: {e}")
+@app.post("/api/v1/wazuh/alert")
+async def receive_wazuh_alert(request: Request):
+    """Receive ALL Wazuh alerts and store in Cibervault."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False}
+
+    rule       = body.get("rule", {})
+    agent      = body.get("agent", {})
+    data       = body.get("data", {})
+    level      = int(rule.get("level", 0))
+    agent_name = agent.get("name") or body.get("hostname") or "unknown"
+    agent_ip   = agent.get("ip", "")
+    agent_wid  = agent.get("id", "000")
+    rule_id    = str(rule.get("id", ""))
+    rule_desc  = rule.get("description", "Wazuh alert")
+    mitre      = rule.get("mitre") or {}
+    mitre_ids  = mitre.get("id", [])
+    mitre_tacs = mitre.get("tactic", [])
+    mitre_id   = (mitre_ids[0]  if isinstance(mitre_ids,  list) and mitre_ids  else "")
+    mitre_tac  = (mitre_tacs[0] if isinstance(mitre_tacs, list) and mitre_tacs else "")
+    severity   = ("critical" if level>=15 else "high"   if level>=12 else
+                  "medium"   if level>=7  else "low"    if level>=4  else "info")
+    is_susp    = level >= 7
+    score      = min(100, level * 6)
+    src_ip     = (data.get("srcip") or data.get("src_ip") or
+                  body.get("src_ip") or "")
+    timestamp  = body.get("timestamp", datetime.utcnow().isoformat())
+    event_id   = str(uuid.uuid4())
+    groups     = rule.get("groups", [])
+
+    # Store the FULL Wazuh JSON — preserve everything for investigation
+    payload_dict = body.copy()
+    payload_dict["source"] = "wazuh"
+    payload_dict["rule_id"] = rule_id
+    payload_dict["rule_level"] = level
+    payload_dict["rule_desc"] = rule_desc
+    payload_dict["agent_name"] = agent_name
+
+    async with aiosqlite.connect(DB) as db:
+        # Match to real Cibervault agent by hostname
+        cur = await db.execute(
+            "SELECT agent_id FROM agents WHERE LOWER(hostname)=LOWER(?) LIMIT 1",
+            (agent_name,))
+        row = await cur.fetchone()
+
+        if row:
+            cv_agent_id = row[0]
+        else:
+            # Create placeholder for this Wazuh agent
+            cv_agent_id = f"wazuh-{agent_wid}"
+            await db.execute("""INSERT OR IGNORE INTO agents
+                (agent_id,hostname,os,ip_address,arch,agent_version,
+                 group_name,enrolled_at,last_seen,status,os_version)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (cv_agent_id, agent_name, "Windows", agent_ip, "x64",
+                 "wazuh", "wazuh-agents",
+                 datetime.utcnow().isoformat(),
+                 datetime.utcnow().isoformat(), "online", ""))
+
+        # Update last_seen for matched agent
+        await db.execute(
+            "UPDATE agents SET last_seen=?, status='online' WHERE agent_id=?",
+            (datetime.utcnow().isoformat(), cv_agent_id))
+
+        await db.execute("""INSERT OR IGNORE INTO events
+            (event_id,agent_id,event_type,event_time,hostname,
+             severity,risk_score,is_suspicious,payload,
+             mitre_id,mitre_tactic,rule_id,rule_name,source_ip,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (event_id, cv_agent_id, "wazuh_alert", timestamp, agent_name,
+             severity, score, 1 if is_susp else 0,
+             json.dumps(payload_dict),
+             mitre_id, mitre_tac, "WAZUH-"+rule_id,
+             rule_desc[:120], src_ip, datetime.utcnow().isoformat()))
+        await db.commit()
+
+    if is_susp:
+        await manager.broadcast({"type": "alert", "data": {
+            "agent_id": cv_agent_id, "hostname": agent_name,
+            "event_type": "wazuh_alert", "severity": severity,
+            "risk_score": score, "rule_name": rule_desc, "source": "wazuh",
+            "mitre_id": mitre_id,
+        }})
+
+    log.info(f"Wazuh [{severity.upper()}] L{level} {agent_name}: {rule_desc[:60]}")
+    return {"ok": True, "event_id": event_id, "hostname": agent_name,
+            "severity": severity, "level": level}
+
+
+@app.get("/api/v1/wazuh/stats")
+async def wazuh_stats(current_user: dict = Depends(get_current_user)):
+    """Stats for Wazuh alerts ingested into Cibervault."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END) as critical,
+                   SUM(CASE WHEN severity='high' THEN 1 ELSE 0 END) as high,
+                   MAX(event_time) as last_alert
+            FROM events WHERE event_type='wazuh_alert'
+        """)
+        row = await cur.fetchone()
+    return dict(row) if row else {}
+
+
+# ─── VirusTotal Integration ───────────────────────────────────────────────────
+
+@app.get("/api/v1/settings/virustotal")
+async def get_vt_config(current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT value FROM settings WHERE key='vt_api_key'")
+        row = await cur.fetchone()
+    key = row[0] if row else ""
+    return {"configured": bool(key), "key_preview": key[:8]+"..." if key else ""}
+
+@app.post("/api/v1/settings/virustotal")
+async def save_vt_config(request: Request, current_user: dict = Depends(require_admin)):
+    body = await request.json()
+    key  = body.get("api_key","").strip()
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES (?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """, ("vt_api_key", key, datetime.utcnow().isoformat()))
+        await db.commit()
+    return {"ok": True}
+
+@app.post("/api/v1/virustotal/scan/hash")
+async def vt_scan_file_hash(request: Request, current_user: dict = Depends(get_current_user)):
+    body = await request.json()
+    file_hash = body.get("hash","").strip()
+    if not file_hash:
+        raise HTTPException(400, "hash required")
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT value FROM settings WHERE key='vt_api_key'")
+        row = await cur.fetchone()
+    if not row or not row[0]:
+        raise HTTPException(400, "VirusTotal API key not configured")
+    result = await vt_scan_hash(row[0], file_hash)
+    # Store result
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO vt_cache (hash, result, scanned_at)
+            VALUES (?,?,?)
+        """, (file_hash, json.dumps(result), datetime.utcnow().isoformat()))
+        await db.commit()
+    return result
+
+@app.post("/api/v1/virustotal/scan/ip")
+async def vt_scan_ip_route(request: Request, current_user: dict = Depends(get_current_user)):
+    body = await request.json()
+    ip = body.get("ip","").strip()
+    if not ip:
+        raise HTTPException(400, "ip required")
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT value FROM settings WHERE key='vt_api_key'")
+        row = await cur.fetchone()
+    if not row or not row[0]:
+        raise HTTPException(400, "VirusTotal API key not configured")
+    result = await vt_scan_ip(row[0], ip)
+    return result
+
+@app.get("/api/v1/virustotal/cache")
+async def get_vt_cache(current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT hash, result, scanned_at FROM vt_cache ORDER BY scanned_at DESC LIMIT 100")
+        rows = [dict(r) for r in await cur.fetchall()]
+    for r in rows:
+        if r.get("result"):
+            try: r["result"] = json.loads(r["result"])
+            except: pass
+    return rows
+
+# ─── UEBA ─────────────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/ueba/profiles")
+async def get_ueba_profiles(current_user: dict = Depends(get_current_user)):
+    return get_ueba().get_all_profiles()
+
+@app.get("/api/v1/ueba/alerts")
+async def get_ueba_alerts(limit: int = 100, current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT event_id, agent_id, hostname, event_time, severity,
+                   risk_score, rule_name, mitre_id, mitre_tactic, source_ip, payload
+            FROM events WHERE event_type='ueba_alert'
+            ORDER BY event_time DESC LIMIT ?
+        """, (limit,))
+        rows = [dict(r) for r in await cur.fetchall()]
+    for r in rows:
+        if r.get("payload"):
+            try: r["payload"] = json.loads(r["payload"])
+            except: pass
+    return rows
+
+@app.get("/api/v1/ueba/stats")
+async def get_ueba_stats(current_user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT rule_id, COUNT(*) as count
+            FROM events WHERE event_type='ueba_alert'
+            GROUP BY rule_id ORDER BY count DESC
+        """)
+        by_type = [dict(r) for r in await cur.fetchall()]
+        cur2 = await db.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type='ueba_alert'")
+        total = (await cur2.fetchone())[0]
+    profiles = get_ueba().get_all_profiles()
+    return {
+        "total_alerts": total,
+        "by_type": by_type,
+        "tracked_users": len(profiles),
+        "high_risk_users": [p for p in profiles if p.get("risk_indicators",0) >= 2],
+    }
+
+# ─── Agent Update Distribution ────────────────────────────────────────────────
+
+@app.post("/api/v1/admin/agent-update")
+async def upload_agent_update(
+    request: Request,
+    current_user: dict = Depends(require_admin)
+):
+    """Upload a new cvagent.py to be distributed to all agents via command."""
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="No file content")
+
+    # Save to update directory
+    update_dir = "/data/agent-updates"
+    import os
+    os.makedirs(update_dir, exist_ok=True)
+    update_path = f"{update_dir}/cvagent.py"
+    with open(update_path, "wb") as f:
+        f.write(body)
+
+    version = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    # Issue update command to all online agents
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT agent_id FROM agents WHERE status='online'")
+        agents = await cur.fetchall()
+
+        count = 0
+        for agent in agents:
+            cid = str(uuid.uuid4())
+            expires_at = (datetime.utcnow() + timedelta(hours=6)).isoformat()
+            await db.execute("""
+                INSERT INTO commands
+                (command_id, agent_id, command_type, parameters, issued_by, status, created_at, expires_at)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (
+                cid, agent["agent_id"], "update_agent",
+                json.dumps({"update_url": f"/api/v1/admin/agent-update/download", "version": version}),
+                current_user["username"], "pending",
+                datetime.utcnow().isoformat(), expires_at
+            ))
+            count += 1
+        await db.commit()
+
+    log.info(f"Agent update v{version} uploaded, queued for {count} agents")
+    return {"ok": True, "version": version, "agents_queued": count}
+
+@app.get("/api/v1/admin/agent-update/download")
+async def download_agent_update():
+    """Agents download the latest update from here."""
+    update_path = "/data/agent-updates/cvagent.py"
+    if not os.path.exists(update_path):
+        raise HTTPException(status_code=404, detail="No update available")
+    from fastapi.responses import FileResponse
+    return FileResponse(update_path, filename="cvagent.py", media_type="text/plain")
+
+@app.get("/api/v1/admin/agent-update/status")
+async def agent_update_status(current_user: dict = Depends(get_current_user)):
+    """Check update distribution status."""
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT status, COUNT(*) as cnt FROM commands
+            WHERE command_type='update_agent'
+            GROUP BY status
+        """)
+        rows = await cur.fetchall()
+    return {r["status"]: r["cnt"] for r in rows}
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8081)),
+        reload=False,
+        workers=1,
+    )

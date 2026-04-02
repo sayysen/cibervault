@@ -1,0 +1,28 @@
+# Database and secrets
+data/
+server.env
+CREDENTIALS.txt
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Build outputs (not source)
+agent-builds/
+agent-installer/
+agent-binaries/
+server/static/downloads/*.exe
+server/static/downloads/*.zip
+
+# Backups
+backups/
+
+# Old files
+*.zip
+*.log
+.env
+agent/
+server/backups/
+agent-source/CibervaultAgent/bin/
+agent-source/CibervaultAgent/obj/
